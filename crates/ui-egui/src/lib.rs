@@ -101,6 +101,11 @@ pub struct UiState {
     pub configurations: Vec<(String, Value)>,
     /// Appearance (`ui.theme`): dark by default, light or follow the system on request.
     pub theme: theme::ThemeMode,
+    /// The main window's size (logical points) and maximized state, and the interface scale, as
+    /// the desktop app last saw them; it restores them at launch.
+    pub window_size: [f32; 2],
+    pub window_maximized: bool,
+    pub ui_scale: f32,
 }
 
 impl Default for UiState {
@@ -153,6 +158,9 @@ impl Default for UiState {
             workspace_dir: String::new(),
             configurations: Vec::new(),
             theme: theme::ThemeMode::Dark,
+            window_size: [1600.0, 1000.0],
+            window_maximized: false,
+            ui_scale: 1.0,
         }
     }
 }
@@ -162,11 +170,21 @@ impl Default for UiState {
 pub struct Services {
     pub pick_open: Option<Box<dyn Fn(&str, &[&str]) -> Option<String>>>,
     pub pick_save: Option<Box<dyn Fn(&str, &str) -> Option<String>>>,
+    pub pick_folder: Option<Box<dyn Fn(&str) -> Option<String>>>,
 }
 
 /// File-system-safe folder name for a plugin id (`clap:com.x.y` → `clap_com.x.y`).
 pub fn preset_folder_name(plugin: &str) -> String {
     plugin.chars().map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }).collect()
+}
+
+/// On the first frame, maximizes a window too big for the screen it opened on (sized on a larger
+/// monitor) instead of letting it run off the edge; its saved size is kept for that monitor.
+pub fn fit_window_to_screen(ctx: &egui::Context) {
+    let (inner, monitor) = ctx.input(|i| (i.viewport().inner_rect, i.viewport().monitor_size));
+    if ctx.cumulative_pass_nr() == 0 && inner.zip(monitor).is_some_and(|(r, m)| (r.size() - m).max_elem() > 0.0) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(true));
+    }
 }
 
 /// Drag-and-drop payload: an audio file (source id) dragged from the Clip List.
@@ -216,10 +234,12 @@ pub struct SoundApp {
     pub autosave_dir: Option<std::path::PathBuf>,
     /// Folder for user plugin presets (native apps set it).
     pub preset_dir: Option<std::path::PathBuf>,
-    last_autosave: f64,
+    last_autosave: Option<std::time::Instant>,
     pub dialogs: dialogs::Dialogs,
     pub meters: HashMap<TrackId, MeterDisplay>,
     pub main_meter: MeterDisplay,
+    /// Reused multichannel snapshot; populated at an adaptive rate by `logic`.
+    meter_snapshot: soundcraft_playback::MeterSnapshot,
     pub gesture: Option<Gesture>,
     pub edit_layout: edit_window::EditLayout,
     pub midi: midi_editor::MidiEditorState,
@@ -247,6 +267,7 @@ pub struct SoundApp {
     last_write_at: Samples,
     pub frame_ms: f32,
     last_frame: Option<f64>,
+    last_meter_poll: f64,
     /// Movies for the Video window and Video track (decoded in the background).
     pub video: video_track::VideoPool,
 }
@@ -276,10 +297,11 @@ impl SoundApp {
             native_menu_bar: false,
             autosave_dir: None,
             preset_dir: None,
-            last_autosave: 0.0,
+            last_autosave: None,
             dialogs: dialogs::Dialogs::default(),
             meters: HashMap::new(),
             main_meter: MeterDisplay::default(),
+            meter_snapshot: soundcraft_playback::MeterSnapshot::default(),
             gesture: None,
             edit_layout: edit_window::EditLayout::default(),
             midi: midi_editor::MidiEditorState::default(),
@@ -302,6 +324,7 @@ impl SoundApp {
             last_write_at: i64::MIN,
             frame_ms: 0.0,
             last_frame: None,
+            last_meter_poll: f64::NEG_INFINITY,
             video: video_track::VideoPool::default(),
         }
     }
@@ -328,6 +351,9 @@ impl SoundApp {
                 if id == "options.scrolling" {
                     // Re-selecting a scrolling mode resumes the playhead follow.
                     self.edit_layout.follow_hold = false;
+                }
+                if id == "track.clear_clip_indicators" {
+                    self.meters.values_mut().chain([&mut self.main_meter]).for_each(|m| m.clip = false);
                 }
                 Ok(v)
             }
@@ -367,6 +393,8 @@ impl SoundApp {
 
     fn stop_play(&mut self) {
         if let Some(p) = &self.player {
+            // Half-speed is a separate command. Stop must not leave that rate for the next Play.
+            p.set_speed(1.0);
             p.stop();
         }
         if self.engine.transport.recording {
@@ -411,17 +439,14 @@ impl SoundApp {
             return;
         }
         self.ensure_input();
-        if self.recorder.is_none() {
-            self.ui.status = "Cannot record: no audio input device".into();
+        if let Err(err) = self.arm_recorder() {
+            self.ui.status = format!("Cannot record: {err}");
             return;
         }
         if let Some(p) = &self.player {
             p.set_recording(true);
         }
         let already_playing = self.is_playing();
-        if let Some(r) = &self.recorder {
-            r.arm();
-        }
         self.engine.transport.recording = true;
         if already_playing {
             // Punch in on the fly at the current playhead.
@@ -445,6 +470,19 @@ impl SoundApp {
             let end = (!sel.is_empty()).then_some(sel.end + post);
             self.start_play(from, end, None);
         }
+    }
+
+    /// Arm the input for the record-enabled tracks; a session never saved records into its
+    /// autosave folder.
+    fn arm_recorder(&mut self) -> Result<(), String> {
+        let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
+        let unsaved_dir = self.autosave_dir.as_ref().map_or_else(std::env::temp_dir, |d| d.join(name));
+        let Some(r) = &mut self.recorder else { return Err("no audio input device".into()) };
+        let plan = soundcraft_engine::io::plan_takes(&self.engine, &unsaved_dir, r.channels);
+        if plan.is_empty() {
+            return Err("no audio track is record-enabled".into());
+        }
+        r.arm(plan)
     }
 
     /// Reads every live third-party plugin's state from the audio engine and stores it on its
@@ -473,15 +511,14 @@ impl SoundApp {
     }
 
     /// Every two minutes, copy a modified session to the autosave folder (not while recording).
-    fn autosave(&mut self, now: f64) {
+    /// Timed by the wall clock: egui's stands still while the window is hidden.
+    fn autosave(&mut self) {
         let Some(dir) = self.autosave_dir.clone() else { return };
-        if self.last_autosave == 0.0 {
-            self.last_autosave = now;
-        }
-        if now - self.last_autosave < 120.0 || !self.engine.is_dirty() || self.engine.transport.recording {
+        let last = *self.last_autosave.get_or_insert_with(std::time::Instant::now);
+        if last.elapsed().as_secs() < 120 || !self.engine.is_dirty() || self.engine.transport.recording {
             return;
         }
-        self.last_autosave = now;
+        self.last_autosave = Some(std::time::Instant::now());
         self.capture_plugin_states();
         let name = soundcraft_engine::io::sanitize_name(&self.engine.session().name);
         let path = dir.join(&name).join(format!("{name}.scraft"));
@@ -512,6 +549,12 @@ impl SoundApp {
         best.map(|(_, p)| p)
     }
 
+    /// Whether the meters are live: while playing, and while armed or input-monitored tracks are heard.
+    fn meters_live(&self) -> bool {
+        self.engine.transport.playing
+            || (self.recorder.is_some() && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm))
+    }
+
     /// Open the input device once (for recording and input monitoring) and feed the player.
     fn ensure_input(&mut self) {
         if self.recorder.is_some() || self.recorder_failed || self.player.is_none() {
@@ -536,49 +579,26 @@ impl SoundApp {
         if let Some(p) = &self.player {
             p.set_recording(false);
         }
-        let Some(r) = &self.recorder else { return };
-        let take = r.take();
-        let rate = take.sample_rate;
+        let Some(r) = &mut self.recorder else { return };
+        let (takes, problem) = r.finish();
+        let tracks = takes.len().max(1);
         let sel = self.engine.session().edit.selection;
-        if self.engine.session().edit.loop_record && !sel.is_empty() {
-            // Split the capture into one take per loop pass; each pass gets its own playlist.
-            let pass = usize::try_from(soundcraft_time::to_samples(sel.len() as f64 * f64::from(rate) / self.engine.session().sample_rate.as_f64()))
-                .unwrap_or(0)
-                .max(1);
-            let total = take.channels.first().map_or(0, Vec::len);
-            let passes = total.div_ceil(pass).max(1);
-            let mut made = 0;
-            for k in 0..passes {
-                let chunk: Vec<Vec<f32>> =
-                    take.channels.iter().map(|c| c.get(k * pass..((k + 1) * pass).min(c.len())).map(<[f32]>::to_vec).unwrap_or_default()).collect();
-                if chunk.first().is_none_or(|c| c.len() < pass / 8) {
-                    continue;
-                }
-                if made > 0 {
-                    let armed: Vec<u64> = self.engine.session().tracks.iter().filter(|t| t.mixer.record_arm).map(|t| t.id.0).collect();
-                    let _ = self.engine.execute("track.playlist_new", &serde_json::json!({"tracks": armed}));
-                }
-                if soundcraft_engine::io::add_recording(&mut self.engine, sel.start, chunk, rate).is_ok() {
-                    made += 1;
-                }
-            }
-            self.ui.status = format!("Loop-recorded {made} take(s)");
-            return;
+        let looped = self.engine.session().edit.loop_record && !sel.is_empty();
+        let (start, pass) = if looped { (sel.start, Some(sel.len())) } else { (self.record_start, None) };
+        let ids = soundcraft_engine::io::add_recording(&mut self.engine, start, takes, pass);
+        if let Some(p) = self.punch.take() {
+            // Keep only the punch range of each new take (merged into the Record undo step).
+            let clip_ids: Vec<u64> = ids.iter().map(|c| c.0).collect();
+            let _ = self.engine.execute_merged(
+                "edit.trim_to_fill_selection",
+                &serde_json::json!({"clips": clip_ids, "start": p.start, "end": p.end}),
+                "record",
+            );
         }
-        match soundcraft_engine::io::add_recording(&mut self.engine, self.record_start, take.channels, rate) {
-            Ok(ids) => {
-                if let Some(p) = self.punch.take() {
-                    // Keep only the punch range of each new take (merged into the Record undo step).
-                    let clip_ids: Vec<u64> = ids.iter().map(|c| c.0).collect();
-                    let _ = self.engine.execute_merged(
-                        "edit.trim_to_fill_selection",
-                        &serde_json::json!({"clips": clip_ids, "start": p.start, "end": p.end}),
-                        "record",
-                    );
-                }
-                self.ui.status = format!("Recorded {} clip(s)", ids.len());
-            }
-            Err(e) => self.ui.status = e.to_string(),
+        self.ui.status = if looped { format!("Loop-recorded {} take(s)", ids.len() / tracks) } else { format!("Recorded {} clip(s)", ids.len()) };
+        if let Some(p) = problem {
+            log::warn!("recording: {p}");
+            self.ui.status = format!("{} ({p})", self.ui.status);
         }
     }
 
@@ -725,7 +745,13 @@ impl SoundApp {
             if self.engine.transport.playing {
                 self.engine.transport.position = p.position();
             }
-            let snap = p.meters();
+            let now = self.last_frame.unwrap_or_default();
+            let meter_interval = if self.ui.window == MainWindow::Mix { 1.0 / 60.0 } else { 1.0 / 20.0 };
+            if now - self.last_meter_poll >= meter_interval {
+                p.copy_meters(&mut self.meter_snapshot);
+                self.last_meter_poll = now;
+            }
+            let snap = &self.meter_snapshot;
             for (id, m) in &snap.tracks {
                 let d = self.meters.entry(*id).or_default();
                 feed_meter(d, m.peak, m.gain_reduction_db, dt);
@@ -749,7 +775,7 @@ impl SoundApp {
                 self.stop_play();
             }
         }
-        if !self.engine.transport.playing {
+        if !self.meters_live() {
             for d in self.meters.values_mut() {
                 feed_meter(d, [0.0, 0.0], 0.0, dt);
             }
@@ -759,6 +785,9 @@ impl SoundApp {
 
     /// Per-frame logic: control channel, transport, document sync.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        if ctx.current_pass_index() > 0 {
+            return;
+        }
         // Fonts set now take effect next frame, so draw only from the frame after.
         if !self.fonts_ready {
             if self.fonts_installed {
@@ -775,8 +804,7 @@ impl SoundApp {
             self.theme_applied = Some(light);
         }
         let now = ctx.input(|i| i.time);
-        let dt = self.last_frame.map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
-        self.last_frame = Some(now);
+        let dt = self.last_frame.replace(now).map_or(1.0 / 60.0, |t| (now - t) as f32).clamp(0.0, 0.25);
         self.frame_ms = self.frame_ms * 0.9 + dt * 1000.0 * 0.1;
         control::drain(self, ctx);
         self.apply_editor_edits();
@@ -798,16 +826,17 @@ impl SoundApp {
             }
         }
         self.write_automation(ctx);
-        self.autosave(now);
+        self.autosave();
         if self.recorder.is_none()
             && !self.recorder_failed
             && self.engine.session().tracks.iter().any(|t| t.mixer.input_monitor || t.mixer.record_arm)
         {
             self.ensure_input();
         }
-        if self.is_playing() || self.meters.values().any(|m| m.level[0] > 0.0001) || !self.pending_shots.is_empty() || !self.synthetic.is_empty() {
-            ctx.request_repaint();
-        }
+        // Autosave and the macOS menu bar only run on frames, and plugin editors are native windows egui never hears from.
+        // egui takes its predicted frame time off every delay, so add it back.
+        let editors = self.player.as_ref().is_some_and(Player::any_editor_open);
+        ctx.request_repaint_after_secs(if editors { 0.03 } else { 1.0 } + ctx.input(|i| i.predicted_dt));
         control::collect_screenshots(self, ctx);
     }
 
@@ -873,6 +902,15 @@ impl SoundApp {
         score_editor::show(self, &ctx);
         palette::show(self, &ctx);
         dialogs::show(self, &ctx);
+        // Here, not in logic(): a covered or minimized window runs only logic(), with no vsync to pace it.
+        if self.meters_live() {
+            let hz = if self.ui.window == MainWindow::Mix { 60 } else { 30 };
+            ctx.request_repaint_after(std::time::Duration::from_millis(1000 / hz));
+        } else if self.meters.values().any(|m| m.level[0] > 0.0001) {
+            ctx.request_repaint_after(std::time::Duration::from_millis(80));
+        } else if !self.pending_shots.is_empty() || !self.synthetic.is_empty() {
+            ctx.request_repaint();
+        }
     }
 
     /// UI state as JSON (control channel `ui.inspect`).
@@ -961,6 +999,20 @@ mod tests {
     }
 
     #[test]
+    fn a_hidden_window_still_autosaves() {
+        let dir = std::env::temp_dir().join(format!("soundcraft-hidden-autosave-{}", std::process::id()));
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        app.autosave_dir = Some(dir.clone());
+        app.run("track.new", json!({"count": 1, "format": "mono"})).unwrap();
+        app.last_autosave = std::time::Instant::now().checked_sub(std::time::Duration::from_secs(121));
+        let hidden = egui::ViewportInfo { minimized: Some(true), ..Default::default() };
+        let raw = egui::RawInput { viewports: [(egui::ViewportId::ROOT, hidden)].into_iter().collect(), ..Default::default() };
+        let _ = egui::Context::default().run_logic(&raw, |ctx| app.logic(ctx));
+        assert!(app.latest_autosave().is_some());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn session_reset_does_not_apply_old_stop_edits_to_the_new_session() {
         let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
         app.run("transport.play", json!({"from": 48_000})).unwrap();
@@ -980,6 +1032,16 @@ mod tests {
     }
 
     #[test]
+    fn clear_all_clip_indicators_clears_every_meter() {
+        let mut app = SoundApp::new(soundcraft_engine::demo::demo_engine(), None, Services::default());
+        let kick = app.engine.session().track_by_name("Kick").unwrap().id;
+        app.meters.entry(kick).or_default().clip = true;
+        app.main_meter.clip = true;
+        app.run("track.clear_clip_indicators", json!({})).unwrap();
+        assert!(!app.meters[&kick].clip && !app.main_meter.clip);
+    }
+
+    #[test]
     fn automation_first_pass_after_start_is_due_without_overflow() {
         // `last_write_at` starts (and resets) at `i64::MIN`: the previous
         // `(pos - last).abs()` panicked here in debug builds.
@@ -996,5 +1058,73 @@ mod tests {
     #[test]
     fn automation_write_fires_after_loop_wrap() {
         assert!(automation_step_due(0, 1_000_000, 960));
+    }
+
+    #[test]
+    fn preferences_saved_before_the_window_was_remembered_keep_full_scale() {
+        let ui: super::UiState = serde_json::from_value(json!({"show_transport": true})).unwrap();
+        assert_eq!((ui.window_size, ui.window_maximized, ui.ui_scale), ([1600.0, 1000.0], false, 1.0));
+    }
+
+    #[test]
+    fn a_window_bigger_than_its_screen_opens_maximized() {
+        let maximizes = |w: f32, frames: usize| {
+            let ctx = egui::Context::default();
+            let info = egui::ViewportInfo {
+                inner_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 1000.0))),
+                monitor_size: Some(egui::vec2(1728.0, 1117.0)),
+                ..Default::default()
+            };
+            let mut maximized = false;
+            for _ in 0..frames {
+                let raw = egui::RawInput { viewports: [(egui::ViewportId::ROOT, info.clone())].into_iter().collect(), ..Default::default() };
+                let mut out = ctx.run_ui(raw, |ui| super::fit_window_to_screen(ui.ctx()));
+                out.textures_delta.clear();
+                maximized = out.viewport_output[&egui::ViewportId::ROOT].commands.contains(&egui::ViewportCommand::Maximized(true));
+            }
+            maximized
+        };
+        assert!(maximizes(2400.0, 1));
+        assert!(!maximizes(1600.0, 1));
+        assert!(!maximizes(2400.0, 2));
+    }
+
+    #[test]
+    fn ordinary_play_after_stop_is_full_speed() {
+        use serde_json::json;
+        let engine = soundcraft_engine::Engine::default();
+        let player = soundcraft_playback::Player::new(engine.session_arc());
+        let mut app = super::SoundApp::new(engine, Some(player), super::Services::default());
+        app.engine.execute("edit.select", &json!({"start": 0, "end": 48000})).unwrap();
+        app.engine.execute("options.loop_playback", &json!({"value": true})).unwrap();
+        app.engine.execute("options.pre_post_roll", &json!({"value": false})).unwrap();
+        let speed = |app: &super::SoundApp| app.player.as_ref().map(|p| p.speed()).unwrap_or(0.0);
+        assert!((speed(&app) - 1.0).abs() < 1e-3);
+
+        app.engine.execute("transport.half_speed", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!(app.is_playing());
+        assert!((speed(&app) - 0.5).abs() < 1e-3, "half-speed playback");
+
+        app.engine.execute("transport.stop", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!(!app.is_playing());
+        assert!((speed(&app) - 1.0).abs() < 1e-3, "stop restores full speed");
+
+        app.engine.execute("transport.play", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!(app.is_playing());
+        assert!((speed(&app) - 1.0).abs() < 1e-3, "ordinary play stays at full speed");
+
+        app.engine.execute("transport.stop", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        app.engine.execute("options.loop_playback", &json!({"value": false})).unwrap();
+        app.engine.execute("transport.half_speed", &json!({})).unwrap();
+        app.handle_transport(1.0 / 60.0);
+        assert!((speed(&app) - 0.5).abs() < 1e-3);
+        app.player.as_ref().unwrap().stop();
+        app.handle_transport(1.0 / 60.0);
+        assert!(!app.is_playing());
+        assert!((speed(&app) - 1.0).abs() < 1e-3, "a half-speed pass that ends on its own restores full speed");
     }
 }
